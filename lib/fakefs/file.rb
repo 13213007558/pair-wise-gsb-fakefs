@@ -343,6 +343,23 @@ module FakeFS
       File.write(file, content, offset, mode: mode)
     end
 
+    def self.mmap(path, length = nil, *args, **options)
+      FakeFS::Mmap.new(path, length, *args, **options)
+    end
+
+    def self.truncate(path, length)
+      file = FileSystem.find(path)
+      raise Errno::ENOENT, path.to_s unless file
+      raise Errno::EISDIR, path.to_s if file.is_a?(FakeDir)
+
+      length = length.to_int if length.respond_to?(:to_int)
+      raise TypeError, 'no implicit conversion into Integer' unless length.is_a?(Integer)
+      raise Errno::EINVAL, path.to_s if length.negative?
+
+      resize_content(file, length)
+      0
+    end
+
     def self.fnmatch?(pattern, path, flags = 0)
       RealFile.fnmatch?(pattern, path, flags)
     end
@@ -606,6 +623,22 @@ module FakeFS
       val = super(*args)
       @file.mtime = Time.now
       val
+    end
+
+    def truncate(length)
+      length = length.to_int if length.respond_to?(:to_int)
+      raise TypeError, 'no implicit conversion into Integer' unless length.is_a?(Integer)
+      raise Errno::EINVAL, @path.to_s if length.negative?
+
+      flush
+      self.class.send(:resize_content, @file, length)
+      0
+    end
+
+    def mmap(length = nil, *args, **options)
+      raise IOError, 'closed stream' if closed?
+
+      FakeFS::Mmap.new(self, length, *args, **options)
     end
 
     alias tell= pos=
@@ -1072,6 +1105,23 @@ module FakeFS
       end
 
       @file = FileSystem.add(path, FakeFile.new)
+    end
+
+    def self.resize_content(file, length)
+      content = file.content
+      current_length = content.bytesize
+      if length < current_length
+        original_encoding = content.encoding
+        content.force_encoding(Encoding::BINARY)
+        content.bytesplice(length, current_length - length, '')
+        content.force_encoding(original_encoding)
+      elsif length > current_length
+        original_encoding = content.encoding
+        content.force_encoding(Encoding::BINARY)
+        content << ("\0".b * (length - current_length))
+        content.force_encoding(original_encoding)
+      end
+      file.mtime = Time.now
     end
   end
 end

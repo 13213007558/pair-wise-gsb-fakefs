@@ -184,8 +184,36 @@ Warning: experimental and might break if you obtain more that one flock per file
 require 'fakefs/flockable_file'
 ```
 
+Memory mappings
+---------------
+
+`FakeFS::Mmap` provides a deterministic, page-oriented memory mapping for tests.
+Shared mappings write directly to the fake file's bytes, while private mappings
+copy touched pages on write. A smaller page size makes page and truncation
+boundary tests deterministic:
+
+```ruby
+FakeFS do
+  File.write('file', 'a' * 32)
+
+  shared = FakeFS::Mmap.new('file', 32, page_size: 16, prot: 'rw')
+  shared[0] = 'b'.ord
+  File.binread('file', 1) # => "b"
+
+  private_map = FakeFS::Mmap.new('file', 32, page_size: 16, flags: :private, prot: 'rw')
+  private_map[0] = 'c'.ord
+  File.binread('file', 1) # => "b"
+end
+```
+
+Offsets must be page aligned. `msync` accepts `MS_SYNC`, `MS_ASYNC`, and
+`MS_INVALIDATE`; private mappings are never written back. If a file is
+truncated, existing mappings keep their original length, but access crossing the
+end of the current file raises `FakeFS::Mmap::BusError`, simulating SIGBUS.
+Access after `unmap` raises `FakeFS::Mmap::UnmappedError`.
+
 Caveats
--------
+--------
 
 FakeFS internally uses the `Pathname` and `FileUtils` constants. If you use
 these in your app, be certain you're properly requiring them and not counting
