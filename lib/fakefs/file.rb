@@ -343,6 +343,24 @@ module FakeFS
       File.write(file, content, offset, mode: mode)
     end
 
+    def self.truncate(path, length)
+      file = FileSystem.find(path)
+      raise Errno::ENOENT, path.to_s unless file
+      raise Errno::EISDIR, path.to_s if File.directory?(file)
+
+      length = Integer(length)
+      raise Errno::EINVAL, 'negative length' if length.negative?
+
+      file.content = truncate_content(file.content, length)
+      file.mtime = Time.now
+      0
+    end
+
+    def self.mmap(file, length, offset: 0, prot: Mmap::PROT_READ,
+                  flags: Mmap::MAP_PRIVATE, page_size: 4096)
+      Mmap.new(file, length, offset: offset, prot: prot, flags: flags, page_size: page_size)
+    end
+
     def self.fnmatch?(pattern, path, flags = 0)
       RealFile.fnmatch?(pattern, path, flags)
     end
@@ -603,9 +621,35 @@ module FakeFS
     end
 
     def write(*args)
+      refresh_mapped_content if writable_io?
       val = super(*args)
+      @file.content = internal_string.dup
       @file.mtime = Time.now
       val
+    end
+
+    def truncate(length)
+      self.class.truncate(@path, length)
+    end
+
+    def mmap(length, offset: 0, prot: Mmap::PROT_READ,
+             flags: Mmap::MAP_PRIVATE, page_size: 4096)
+      self.class.mmap(self, length, offset: offset, prot: prot, flags: flags, page_size: page_size)
+    end
+
+    def read(*args)
+      refresh_mapped_content if readable_io?
+      super
+    end
+
+    def gets(*args)
+      refresh_mapped_content if readable_io?
+      super
+    end
+
+    def getbyte
+      refresh_mapped_content if readable_io?
+      super
     end
 
     alias tell= pos=
@@ -666,7 +710,8 @@ module FakeFS
       raise NotImplementedError
     end
 
-    def readpartial(*)
+    def readpartial(*args)
+      refresh_mapped_content if readable_io?
       super
     end
 
@@ -950,6 +995,15 @@ module FakeFS
     private_class_method :convert_symbolic_chmod_to_absolute, :calculate_chmod_amt_for_mode
     private_class_method :get_perms_for_group, :set_perms_for_group
 
+    def self.truncate_content(content, length)
+      binary = content.b
+      return binary.byteslice(0, length).ljust(length, "\0".b) if binary.bytesize < length
+
+      binary.byteslice(0, length)
+    end
+
+    private_class_method :truncate_content
+
     private
 
     def extract_binmode(opts, fmode)
@@ -1072,6 +1126,40 @@ module FakeFS
       end
 
       @file = FileSystem.add(path, FakeFile.new)
+    end
+
+    def refresh_mapped_content
+      position = pos
+      if content_changed?
+        StringIO.instance_method(:string=).bind(self).call(content_for_io)
+        seek(position)
+      end
+    rescue Errno::ESPIPE, IOError
+      nil
+    end
+
+    def internal_string
+      StringIO.instance_method(:string).bind(self).call
+    end
+
+    def content_changed?
+      internal = internal_string
+      internal.bytesize != @file.content.bytesize || internal.b != @file.content.b
+    end
+
+    def content_for_io
+      content = @file.content.dup
+      return content.force_encoding(Encoding::BINARY) if binmode?
+
+      content.force_encoding(Encoding.default_external)
+    end
+
+    def readable_io?
+      @fmode & FMODE_READABLE != 0
+    end
+
+    def writable_io?
+      @fmode & FMODE_WRITABLE != 0
     end
   end
 end

@@ -14,6 +14,18 @@ module FakeFS
 
     attr_accessor :content, :links, :inode_num
 
+    def mapped_page(page_number, page_size)
+      start = page_number * page_size
+      page = content.byteslice(start, page_size) || ''.b
+      page.b.ljust(page_size, "\0".b)
+    end
+
+    def write_mapped_byte(position, byte)
+      content.force_encoding(Encoding::BINARY)
+      content << "\0".b * (position - content.bytesize) if position >= content.bytesize
+      content.setbyte(position, byte & 0xff)
+    end
+
     # please see: http://iacobson.net/beware-of-ruby-class-variables/
     class << self
       attr_accessor :freed_inodes, :next_inode_num
