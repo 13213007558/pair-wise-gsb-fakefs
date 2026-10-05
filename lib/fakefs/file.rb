@@ -33,6 +33,24 @@ module FakeFS
     FILE_CREATION_MODES = (MODES - [READ_ONLY, READ_WRITE]).freeze
     FILE_ACCESS_MODE = (RealFile::RDONLY | RealFile::WRONLY | RealFile::RDWR)
 
+    # fcntl(2) record locking commands. Real IO does not expose these
+    # constants on every platform, so FakeFS normalizes on the Linux values.
+    F_GETLK = RealIO.const_defined?(:F_GETLK) ? RealIO::F_GETLK : 5
+    F_SETLK = RealIO.const_defined?(:F_SETLK) ? RealIO::F_SETLK : 6
+    F_SETLKW = RealIO.const_defined?(:F_SETLKW) ? RealIO::F_SETLKW : 7
+    F_OFD_GETLK = RealIO.const_defined?(:F_OFD_GETLK) ? RealIO::F_OFD_GETLK : 36
+    F_OFD_SETLK = RealIO.const_defined?(:F_OFD_SETLK) ? RealIO::F_OFD_SETLK : 37
+    F_OFD_SETLKW = RealIO.const_defined?(:F_OFD_SETLKW) ? RealIO::F_OFD_SETLKW : 38
+
+    # struct flock l_type values (identical on Linux and macOS)
+    F_RDLCK = 1
+    F_UNLCK = 2
+    F_WRLCK = 3
+
+    # struct flock layout on 64-bit Linux and macOS:
+    # short l_type; short l_whence; off_t l_start; off_t l_len; pid_t l_pid;
+    FLOCK_STRUCT_FORMAT = 'ssx4qqix4'
+
     # copied from https://github.com/ruby/ruby/blob/v2_7_8/include/ruby/io.h#L108
     MODE_BITMASK = (
       RealFile::RDONLY |
@@ -498,6 +516,10 @@ module FakeFS
 
     attr_reader :path
 
+    # Open file description, shared with dup'ed descriptors (see #initialize_copy)
+    attr_reader :open_file_description
+    protected :open_file_description
+
     def initialize(path, *args)
       # unable to pass args otherwise on jruby, it may cause false passes on MRI, though
       # because explicit hash isn't supported
@@ -556,6 +578,7 @@ module FakeFS
 
       @autoclose = true
       file_creation_mode? ? create_missing_file : check_file_existence!
+      @open_file_description = OpenFileDescription.new(@file.inode)
       # StringIO changes enciding of the underlying string to binary
       # when binary data is written if it's opened in binary mode,
       # so content might have binary encoding. StringIO also switches to
@@ -637,6 +660,36 @@ module FakeFS
 
     def ioctl(*)
       raise NotImplementedError
+    end
+
+    # Simulates fcntl(2) byte-range record locks (struct flock). The lock
+    # request can be passed as a packed struct flock string (see
+    # FLOCK_STRUCT_FORMAT), which F_GETLK/F_OFD_GETLK update in place, or
+    # as an [l_type, l_whence, l_start, l_len] array, which is updated in
+    # place as well. POSIX commands (F_SETLK/F_SETLKW/F_GETLK) attribute
+    # locks to the current FakeFS::VirtualProcess, OFD commands
+    # (F_OFD_SETLK/F_OFD_SETLKW/F_OFD_GETLK) to the open file description.
+    def fcntl(command, arg = nil)
+      raise IOError, 'closed stream' if closed?
+      case command
+      when F_GETLK, F_OFD_GETLK
+        fcntl_get_lock(command, arg)
+      when F_SETLK, F_SETLKW, F_OFD_SETLK, F_OFD_SETLKW
+        fcntl_set_lock(command, arg)
+      else
+        raise NotImplementedError, "fcntl(#{command}) is not supported by FakeFS"
+      end
+    end
+
+    def initialize_copy(other)
+      super
+      # dup'ed descriptors share the open file description
+      @open_file_description = other.open_file_description&.retain
+    end
+
+    def close
+      release_record_locks unless closed?
+      super
     end
 
     def read_nonblock
@@ -951,6 +1004,128 @@ module FakeFS
     private_class_method :get_perms_for_group, :set_perms_for_group
 
     private
+
+    def release_record_locks
+      return if @open_file_description.nil?
+      inode = @open_file_description.inode
+      # POSIX: closing any descriptor for the file drops every lock the
+      # current (virtual) process holds on that inode.
+      RecordLocking.release_process_locks(inode, VirtualProcess.current)
+      # OFD: locks are dropped when the last descriptor of the open file
+      # description is closed.
+      @open_file_description.release
+    end
+
+    def fcntl_set_lock(command, arg)
+      type, whence, start, len = parse_flock(arg)
+      check_lock_access!(type) unless type == F_UNLCK
+      first, last = lock_range(whence, start, len)
+      wait = command == F_SETLKW || command == F_OFD_SETLKW
+      acquired = RecordLocking.lock(
+        @open_file_description.inode, lock_owner(command), flock_type(type), first, last, wait: wait
+      )
+      raise Errno::EAGAIN, @path unless acquired
+      0
+    end
+
+    def fcntl_get_lock(command, arg)
+      type, whence, start, len = parse_flock(arg)
+      first, last = lock_range(whence, start, len)
+      conflict = RecordLocking.conflicting_lock(
+        @open_file_description.inode, lock_owner(command), flock_type(type), first, last
+      )
+      result =
+        if conflict
+          owner = conflict.owner
+          pid = owner.kind == :process ? owner.subject.pid : -1
+          [flock_type_value(conflict.type), SEEK_SET, conflict.first,
+           conflict.last.infinite? ? 0 : conflict.last - conflict.first, pid]
+        else
+          [F_UNLCK, whence, start, len, 0]
+        end
+      write_flock(arg, result)
+      0
+    end
+
+    def parse_flock(arg)
+      values =
+        if arg.is_a?(String)
+          arg.unpack(FLOCK_STRUCT_FORMAT)
+        elsif arg.is_a?(Array)
+          arg
+        else
+          raise TypeError, "no implicit conversion of #{arg.class} into String"
+        end
+      type, whence, start, len = values
+      unless [type, whence, start, len].all? { |value| value.is_a?(Integer) }
+        raise Errno::EINVAL, @path
+      end
+      unless [F_RDLCK, F_WRLCK, F_UNLCK].include?(type)
+        raise Errno::EINVAL, @path
+      end
+      [type, whence, start, len]
+    end
+
+    def write_flock(arg, values)
+      if arg.is_a?(String)
+        arg.replace(values.pack(FLOCK_STRUCT_FORMAT))
+      else
+        arg.replace(values)
+      end
+    end
+
+    # Translates l_whence/l_start/l_len into an absolute [first, last)
+    # range, where last == Float::INFINITY means "to end of file".
+    def lock_range(whence, start, len)
+      base =
+        case whence
+        when SEEK_SET then 0
+        when SEEK_CUR then pos
+        when SEEK_END then @file.content.bytesize
+        else raise Errno::EINVAL, @path
+        end
+      first = base + start
+      if len.negative?
+        # Linux locks the |len| bytes preceding first for negative l_len
+        last = first
+        first += len
+      else
+        last = len.zero? ? Float::INFINITY : first + len
+      end
+      raise Errno::EINVAL, @path if first.negative?
+      [first, last]
+    end
+
+    def lock_owner(command)
+      if command == F_OFD_GETLK || command == F_OFD_SETLK || command == F_OFD_SETLKW
+        RecordLocking::Owner.new(:ofd, @open_file_description)
+      else
+        RecordLocking::Owner.new(:process, VirtualProcess.current)
+      end
+    end
+
+    def flock_type(type)
+      case type
+      when F_RDLCK then :read
+      when F_WRLCK then :write
+      when F_UNLCK then :unlock
+      end
+    end
+
+    def flock_type_value(type)
+      case type
+      when :read then F_RDLCK
+      when :write then F_WRLCK
+      end
+    end
+
+    def check_lock_access!(type)
+      if type == F_WRLCK && @fmode & FMODE_WRITABLE == 0
+        raise Errno::EBADF, @path
+      elsif type == F_RDLCK && @fmode & FMODE_READABLE == 0
+        raise Errno::EBADF, @path
+      end
+    end
 
     def extract_binmode(opts, fmode)
       textmode = opts[:textmode]

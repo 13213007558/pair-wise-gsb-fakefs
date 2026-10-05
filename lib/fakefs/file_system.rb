@@ -16,6 +16,8 @@ module FakeFS
     def clear
       @dir_levels = nil
       @fs = nil
+      FakeFS::RecordLocking.reset!
+      FakeFS::VirtualProcess.reset!
     end
 
     def files

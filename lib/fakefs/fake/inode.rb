@@ -9,10 +9,11 @@ module FakeFS
     def initialize(file_owner)
       @content = ''.encode(Encoding.default_external)
       @links = [file_owner]
+      @record_locks = []
       assign_inode_num
     end
 
-    attr_accessor :content, :links, :inode_num
+    attr_accessor :content, :links, :inode_num, :record_locks
 
     # please see: http://iacobson.net/beware-of-ruby-class-variables/
     class << self
@@ -49,6 +50,7 @@ module FakeFS
     def clone
       clone = super
       clone.content = content.dup
+      clone.record_locks = []
       clone.assign_inode_num
       clone
     end
