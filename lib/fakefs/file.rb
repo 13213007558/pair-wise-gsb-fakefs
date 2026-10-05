@@ -33,6 +33,19 @@ module FakeFS
     FILE_CREATION_MODES = (MODES - [READ_ONLY, READ_WRITE]).freeze
     FILE_ACCESS_MODE = (RealFile::RDONLY | RealFile::WRONLY | RealFile::RDWR)
 
+    F_GETLK  = RealFcntl::F_GETLK
+    F_SETLK  = RealFcntl::F_SETLK
+    F_SETLKW = RealFcntl::F_SETLKW
+    F_RDLCK  = RealFcntl::F_RDLCK
+    F_WRLCK  = RealFcntl::F_WRLCK
+    F_UNLCK  = RealFcntl::F_UNLCK
+    F_OFD_GETLK  = RealFcntl.const_defined?(:F_OFD_GETLK) ? RealFcntl::F_OFD_GETLK : 36
+    F_OFD_SETLK  = RealFcntl.const_defined?(:F_OFD_SETLK) ? RealFcntl::F_OFD_SETLK : 37
+    F_OFD_SETLKW = RealFcntl.const_defined?(:F_OFD_SETLKW) ? RealFcntl::F_OFD_SETLKW : 38
+
+    Flock = FakeFS::ByteRangeLock
+    ByteRangeLock = FakeFS::ByteRangeLock
+
     # copied from https://github.com/ruby/ruby/blob/v2_7_8/include/ruby/io.h#L108
     MODE_BITMASK = (
       RealFile::RDONLY |
@@ -555,6 +568,9 @@ module FakeFS
       @fmode = extract_binmode(opts, @fmode)
 
       @autoclose = true
+      @process_id = ProcessContext.current_id
+      @open_file_description = OpenFileDescription.new
+      @closed_byte_range_descriptors = false
       file_creation_mode? ? create_missing_file : check_file_existence!
       # StringIO changes enciding of the underlying string to binary
       # when binary data is written if it's opened in binary mode,
@@ -600,6 +616,59 @@ module FakeFS
 
     def exists?
       true
+    end
+
+    def fcntl(command, lock = nil)
+      raise IOError, 'closed stream' if closed?
+
+      command = integer_argument(command, 'command')
+      action, open_file_description_lock = command_action(command)
+      request, _whence = lock_request(lock, action == :get)
+      action = :unlock if request.lock_type == RealFcntl::F_UNLCK && action != :get
+
+      validate_lock_access!(request) if action != :get && action != :unlock
+
+      owner = if open_file_description_lock
+                [:open_file_description, @open_file_description.object_id]
+              else
+                [:process, @process_id]
+              end
+
+      case action
+      when :get
+        found_lock = @file.inode.byte_range_locks.get(request, owner)
+        if found_lock
+          lock.l_type = found_lock.lock_type
+          lock.l_start = found_lock.start_position
+          lock.l_len = found_lock.byte_length.infinite? ? 0 : found_lock.byte_length
+          lock.l_whence = RealFile::SEEK_SET
+          lock.l_pid = process_id_for(found_lock.owner)
+        else
+          lock.l_type = RealFcntl::F_UNLCK
+        end
+        0
+      when :set
+        @file.inode.byte_range_locks.set(request, owner, false)
+      when :set_wait
+        @file.inode.byte_range_locks.set(request, owner, true)
+      when :unlock
+        @file.inode.byte_range_locks.unlock(
+          request.start_position,
+          request.byte_length,
+          owner
+        )
+      end
+    end
+
+    def close
+      return nil if closed_byte_range_descriptors?
+
+      @byte_range_descriptors_closed = true
+      inode = @file&.inode
+      inode&.byte_range_locks&.release_owner([:process, @process_id])
+      @open_file_description&.release(inode)
+      super
+      nil
     end
 
     def write(*args)
@@ -754,6 +823,124 @@ module FakeFS
     end
 
     def advise(_advice, _offset = 0, _len = 0); end
+
+    private
+
+    def initialize_copy(source)
+      raise IOError, 'closed stream' if source.closed?
+
+      super
+      @closed_byte_range_descriptors = false
+      @process_id = ProcessContext.current_id
+      @open_file_description = source.instance_variable_get(:@open_file_description)
+      @open_file_description.reference!
+    end
+
+    def command_action(command)
+      case command
+      when RealFcntl::F_GETLK then [:get, false]
+      when RealFcntl::F_SETLK then [:set, false]
+      when RealFcntl::F_SETLKW then [:set_wait, false]
+      when F_OFD_GETLK then [:get, true]
+      when F_OFD_SETLK then [:set, true]
+      when F_OFD_SETLKW then [:set_wait, true]
+      else
+        raise Errno::EINVAL
+      end
+    end
+
+    def lock_request(lock, get_request)
+      required_fields = %i[l_type l_start l_len l_whence]
+      required_fields.each do |field|
+        unless lock.respond_to?(field)
+          raise ArgumentError, "byte-range lock requires ##{field}"
+        end
+      end
+
+      type = integer_argument(lock.l_type, 'l_type')
+      unless [RealFcntl::F_RDLCK, RealFcntl::F_WRLCK, RealFcntl::F_UNLCK].include?(type)
+        raise Errno::EINVAL
+      end
+      raise Errno::EINVAL if get_request && type == RealFcntl::F_UNLCK
+
+      whence = integer_argument(lock.l_whence, 'l_whence')
+      relative_start = integer_argument(lock.l_start, 'l_start')
+      length = integer_argument(lock.l_len, 'l_len')
+
+      start = case whence
+              when RealFile::SEEK_SET then relative_start
+              when RealFile::SEEK_CUR then pos + relative_start
+              when RealFile::SEEK_END then @file.content.bytesize + relative_start
+              else raise Errno::EINVAL
+              end
+      raise Errno::EINVAL if start.negative?
+
+      if length.zero?
+        request_length = Float::INFINITY
+      elsif length.negative?
+        start += length
+        raise Errno::EINVAL if start.negative?
+
+        request_length = -length
+      else
+        request_length = length
+      end
+
+      [
+        ByteRangeLockTable::Request.new(
+          lock_type: type,
+          start_position: start,
+          byte_length: request_length
+        ),
+        whence
+      ]
+    end
+
+    def integer_argument(value, name)
+      return value if value.is_a?(Integer)
+      unless value.respond_to?(:to_int)
+        raise TypeError, "no implicit conversion of #{value.class} into Integer for #{name}"
+      end
+
+      value = value.to_int
+      unless value.is_a?(Integer)
+        raise TypeError, "can't convert #{name} to Integer"
+      end
+      value
+    end
+
+    def validate_lock_access!(request)
+      if request.lock_type == RealFcntl::F_RDLCK && @fmode & FMODE_READABLE == 0
+        raise Errno::EBADF
+      elsif request.lock_type == RealFcntl::F_WRLCK && @fmode & FMODE_WRITABLE == 0
+        raise Errno::EBADF
+      end
+    end
+
+    def process_id_for(owner)
+      owner.first == :process ? owner.last : -1
+    end
+
+    def closed_byte_range_descriptors?
+      @closed_byte_range_descriptors == true
+    end
+
+    class OpenFileDescription
+      attr_reader :references
+
+      def initialize
+        @references = 1
+      end
+
+      def reference!
+        @references += 1
+      end
+
+      def release(inode)
+        @references -= 1
+        inode&.byte_range_locks&.release_owner([:open_file_description, object_id]) if @references.zero?
+      end
+    end
 
     def self.write(filename, contents, offset = nil, **open_args)
       mode = offset ? 'r+' : 'w'

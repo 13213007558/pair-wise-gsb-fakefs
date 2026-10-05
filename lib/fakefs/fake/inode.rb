@@ -9,10 +9,12 @@ module FakeFS
     def initialize(file_owner)
       @content = ''.encode(Encoding.default_external)
       @links = [file_owner]
+      @byte_range_locks = ByteRangeLockTable.new
       assign_inode_num
     end
 
     attr_accessor :content, :links, :inode_num
+    attr_reader :byte_range_locks
 
     # please see: http://iacobson.net/beware-of-ruby-class-variables/
     class << self
@@ -49,6 +51,7 @@ module FakeFS
     def clone
       clone = super
       clone.content = content.dup
+      clone.instance_variable_set(:@byte_range_locks, ByteRangeLockTable.new)
       clone.assign_inode_num
       clone
     end

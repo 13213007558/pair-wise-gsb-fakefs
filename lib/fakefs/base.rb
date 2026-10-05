@@ -5,6 +5,7 @@ RealFileTest        = FileTest
 RealFileUtils       = FileUtils
 RealDir             = Dir
 RealIO              = IO
+RealFcntl           = Fcntl
 RealPathname        = Pathname
 
 def RealPathname(*args)

@@ -2,13 +2,17 @@
 
 require 'fileutils'
 require 'pathname'
+require 'fcntl'
 require 'fakefs/pry'
 require 'fakefs/irb' if Gem::Specification.find_all_by_name("irb").any?
 require 'fakefs/base'
+require 'fakefs/process_context'
+require 'fakefs/lock_scheduler'
 require 'fakefs/fake/file'
 require 'fakefs/fake/dir'
 require 'fakefs/fake/inode'
 require 'fakefs/fake/symlink'
+require 'fakefs/fake/byte_range_lock'
 require 'fakefs/file_system'
 require 'fakefs/fileutils'
 require 'fakefs/file'
